@@ -36,12 +36,11 @@ module Fluent
       super
 
       File.open(@timestamp_file, File::RDWR|File::CREAT).close
-      File.open(@buf_file, File::RDWR|File::CREAT).close
 
       raise StandardError.new("s3 bucket not found #{@s3_bucketname}") unless s3bucket_is_ok()
 
       @loop = Coolio::Loop.new
-      timer_trigger = TimerWatcher.new(@refresh_interval, true, &method(:input))
+      timer_trigger = TimerWatcher.new(@refresh_interval, true, &method(:fetch))
       timer_trigger.attach(@loop)
       @thread = Thread.new(&method(:run))
     end
@@ -114,7 +113,7 @@ module Fluent
       end
     end
 
-    def input
+    def fetch
       $log.debug "start"
 
       timestamp = get_timestamp_file()
@@ -132,9 +131,13 @@ module Fluent
           cf_timestamp_unixtime: object_key[:cf_timestamp_unixtime],
         }
 
-        get_file_from_s3(object_key[:key])
-        emit_lines_from_buffer_file(record_common)
-
+        object_name = object_key[:key]
+        $log.debug "getting object from s3 name is #{object_name}"
+        access_log = s3_client.get_object(
+          bucket: @s3_bucketname,
+          key: object_name
+        ).body.string
+        emit_log(access_log, record_common)
         put_timestamp_file(object_key[:cf_timestamp_unixtime])
       end
     end
@@ -173,69 +176,41 @@ module Fluent
       end
     end
 
-    def sort_object_key(src_object_keys)
+    def emit_log(access_log, record_common)
       begin
-        src_object_keys.sort do |a, b|
-          a[:cf_timestamp_unixtime] <=> b[:cf_timestamp_unixtime]
-        end
-      rescue => e
-        $log.warn "error occurred: #{e.message}"
-      end
-    end
-
-    def get_file_from_s3(object_name)
-      begin
-        $log.debug "getting object from s3 name is #{object_name}"
-        File.open(@buf_file, File::WRONLY|File::CREAT|File::TRUNC) do |file|
-          s3_client.get_object(
-            bucket: @s3_bucketname,
-            key: object_name
-          ) do |chunk|
-            file.write(chunk)
+        access_log.split("\n").each do |line|
+          line_match = ACCESSLOG_REGEXP.match(line)
+          unless line_match
+            $log.info "nomatch log found: #{line} in #{record_common['key']}"
+            next
           end
-        end
-      rescue => e
-        $log.warn "error occurred: #{e.message}"
-      end
-    end
 
-    def emit_lines_from_buffer_file(record_common)
-      begin
-        File.open(@buf_file, File::RDONLY) do |file|
-          file.each_line do |line|
-            line_match = ACCESSLOG_REGEXP.match(line)
-            unless line_match
-              $log.info "nomatch log found: #{line} in #{record_common['key']}"
-              next
-            end
+          record = {
+            datetime: line_match[:datetime],
+            x_edge_location: line_match[:x_edge_location],
+            sc_bytes: line_match[:sc_bytes],
+            c_ip: line_match[:c_ip],
+            cs_method: line_match[:cs_method],
+            cs_host: line_match[:cs_host].to_f,
+            cs_uri_stem: line_match[:cs_uri_stem],
+            sc_status: line_match[:sc_status],
+            cs_referer: line_match[:cs_referer],
+            cs_ua: line_match[:cs_ua],
+            cs_uri_query: line_match[:cs_uri_query],
+            cs_cookie: line_match[:cs_cookie],
+            x_edge_result_type: line_match[:x_edge_result_type],
+            x_edge_request_id: line_match[:x_edge_request_id],
+            x_host_header: line_match[:x_host_header],
+            cs_protocol: line_match[:cs_protocol],
+            cs_bytes: line_match[:cs_bytes],
+            time_taken: line_match[:time_taken],
+            x_forwarded_for: line_match[:x_forwarded_for],
+            ssl_protocol: line_match[:ssl_protocol],
+            ssl_cipher: line_match[:ssl_cipher],
+            x_edge_response_result_type: line_match[:x_edge_response_result_type]
+          }
 
-            record = {
-              datetime: line_match[:datetime],
-              x_edge_location: line_match[:x_edge_location],
-              sc_bytes: line_match[:sc_bytes],
-              c_ip: line_match[:c_ip],
-              cs_method: line_match[:cs_method],
-              cs_host: line_match[:cs_host].to_f,
-              cs_uri_stem: line_match[:cs_uri_stem],
-              sc_status: line_match[:sc_status],
-              cs_referer: line_match[:cs_referer],
-              cs_ua: line_match[:cs_ua],
-              cs_uri_query: line_match[:cs_uri_query],
-              cs_cookie: line_match[:cs_cookie],
-              x_edge_result_type: line_match[:x_edge_result_type],
-              x_edge_request_id: line_match[:x_edge_request_id],
-              x_host_header: line_match[:x_host_header],
-              cs_protocol: line_match[:cs_protocol],
-              cs_bytes: line_match[:cs_bytes],
-              time_taken: line_match[:time_taken],
-              x_forwarded_for: line_match[:x_forwarded_for],
-              ssl_protocol: line_match[:ssl_protocol],
-              ssl_cipher: line_match[:ssl_cipher],
-              x_edge_response_result_type: line_match[:x_edge_response_result_type]
-            }
-
-            router.emit(@tag, Fluent::Engine.now, record_common.merge(record))
-          end
+          router.emit(@tag, Fluent::Engine.now, record_common.merge(record))
         end
       rescue => e
         $log.warn "error occurred: #{e.message}"
